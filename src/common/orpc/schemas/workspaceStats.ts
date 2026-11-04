@@ -96,6 +96,21 @@ export const SessionTimingStatsSchema = z.object({
   byModel: z.record(z.string(), ModelTimingStatsSchema),
 });
 
+/**
+ * Timing for one sub-agent (descendant) workspace, folded into its ancestor's snapshot.
+ *
+ * Sub-agents run in their own workspaces, so without this the parent's Stats panels stay
+ * empty while sub-agents work. Children that the parent already merged on removal (the
+ * `rolledUpFrom` ledger) are omitted to avoid double counting.
+ */
+export const ChildWorkspaceStatsSchema = z.object({
+  workspaceId: z.string(),
+  title: z.string().optional(),
+
+  active: ActiveStreamStatsSchema.optional(),
+  session: SessionTimingStatsSchema.optional(),
+});
+
 export const WorkspaceStatsSnapshotSchema = z.object({
   workspaceId: z.string(),
   generatedAt: z.number(),
@@ -103,6 +118,9 @@ export const WorkspaceStatsSnapshotSchema = z.object({
   active: ActiveStreamStatsSchema.optional(),
   lastRequest: CompletedStreamStatsSchema.optional(),
   session: SessionTimingStatsSchema.optional(),
+
+  /** Live and completed timing of sub-agent workspaces below this one. */
+  children: z.array(ChildWorkspaceStatsSchema).optional(),
 });
 
 export const SessionTimingFileSchema = z.object({
@@ -124,5 +142,7 @@ export const SessionTimingFileSchema = z.object({
 export type TimingAnomaly = z.infer<typeof TimingAnomalySchema>;
 export type ActiveStreamStats = z.infer<typeof ActiveStreamStatsSchema>;
 export type CompletedStreamStats = z.infer<typeof CompletedStreamStatsSchema>;
+export type SessionTimingStats = z.infer<typeof SessionTimingStatsSchema>;
+export type ChildWorkspaceStats = z.infer<typeof ChildWorkspaceStatsSchema>;
 export type WorkspaceStatsSnapshot = z.infer<typeof WorkspaceStatsSnapshotSchema>;
 export type SessionTimingFile = z.infer<typeof SessionTimingFileSchema>;

@@ -7,6 +7,12 @@ import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { computeTimingPercentages } from "@/browser/utils/timingPercentages";
 import { calculateAverageTPS } from "@/browser/utils/messages/StreamingTPSCalculator";
 import { formatDuration } from "@/common/utils/formatDuration";
+import { getModelTimingKey } from "@/common/utils/modelTimingKey";
+import type {
+  ActiveStreamStats,
+  ChildWorkspaceStats,
+  SessionTimingStats,
+} from "@/common/orpc/schemas/workspaceStats";
 import type { UsageViewMode } from "@/common/config/schemas/userPreferences";
 
 // Colors for timing components (matching TOKEN_COMPONENT_COLORS style)
@@ -80,9 +86,14 @@ function useStatsData(workspaceId: string) {
   const active = snapshot?.active;
   const session = snapshot?.session;
   const lastRequest = snapshot?.lastRequest;
+  // Sub-agent workspaces fold into this snapshot so their timing shows while they run.
+  const children = snapshot?.children;
 
   const hasAnyData =
-    active !== undefined || lastRequest !== undefined || (session?.responseCount ?? 0) > 0;
+    active !== undefined ||
+    lastRequest !== undefined ||
+    (session?.responseCount ?? 0) > 0 ||
+    (children?.length ?? 0) > 0;
 
   const onClearStats = async (): Promise<void> => {
     const client = window.__ORPC_CLIENT__;
@@ -103,6 +114,7 @@ function useStatsData(workspaceId: string) {
     active,
     session,
     lastRequest,
+    children,
     hasAnyData,
     onClearStats,
     workspaceId,
@@ -202,6 +214,7 @@ export function TimingPanel(props: TimingPanelProps) {
     active,
     session,
     lastRequest,
+    children,
     hasAnyData,
     onClearStats,
   } = data;
@@ -232,16 +245,54 @@ export function TimingPanel(props: TimingPanelProps) {
     );
   }
 
-  const sessionTotalDuration = (session?.totalDurationMs ?? 0) + (active?.elapsedMs ?? 0);
+  // Session view spans this workspace plus its sub-agents, and includes every live stream so
+  // the numbers advance step by step instead of only when a turn finishes.
+  const childList = children ?? [];
+  const sumChild = (pick: (child: (typeof childList)[number]) => number) =>
+    childList.reduce((total, child) => total + pick(child), 0);
+
+  const sessionTotalDuration =
+    (session?.totalDurationMs ?? 0) +
+    (active?.elapsedMs ?? 0) +
+    sumChild((child) => (child.session?.totalDurationMs ?? 0) + (child.active?.elapsedMs ?? 0));
   const sessionToolExecutionMs =
-    (session?.totalToolExecutionMs ?? 0) + (active?.toolExecutionMs ?? 0);
+    (session?.totalToolExecutionMs ?? 0) +
+    (active?.toolExecutionMs ?? 0) +
+    sumChild(
+      (child) => (child.session?.totalToolExecutionMs ?? 0) + (child.active?.toolExecutionMs ?? 0)
+    );
   const sessionModelTimeMs = Math.max(0, sessionTotalDuration - sessionToolExecutionMs);
-  const sessionStreamingMs = (session?.totalStreamingMs ?? 0) + (active?.streamingMs ?? 0);
-  const sessionAvgTtftMs = computeAverageTtft(session?.totalTtftMs ?? 0, session?.ttftCount ?? 0);
-  const sessionTotalTtftMs = (session?.totalTtftMs ?? 0) + (active?.ttftMs ?? 0);
+  const sessionStreamingMs =
+    (session?.totalStreamingMs ?? 0) +
+    (active?.streamingMs ?? 0) +
+    sumChild((child) => (child.session?.totalStreamingMs ?? 0) + (child.active?.streamingMs ?? 0));
+  const sessionTotalTtftMs =
+    (session?.totalTtftMs ?? 0) +
+    (active?.ttftMs ?? 0) +
+    sumChild((child) => (child.session?.totalTtftMs ?? 0) + (child.active?.ttftMs ?? 0));
+  const sessionTtftCount =
+    (session?.ttftCount ?? 0) + sumChild((child) => child.session?.ttftCount ?? 0);
+  const sessionAvgTtftMs = computeAverageTtft(sessionTotalTtftMs, sessionTtftCount);
+
+  const sessionResponseCount =
+    (session?.responseCount ?? 0) +
+    (active ? 1 : 0) +
+    sumChild((child) => (child.session?.responseCount ?? 0) + (child.active ? 1 : 0));
+  const sessionOutputTokens =
+    (session?.totalOutputTokens ?? 0) +
+    (active?.outputTokens ?? 0) +
+    sumChild(
+      (child) => (child.session?.totalOutputTokens ?? 0) + (child.active?.outputTokens ?? 0)
+    );
+  const sessionReasoningTokens =
+    (session?.totalReasoningTokens ?? 0) +
+    (active?.reasoningTokens ?? 0) +
+    sumChild(
+      (child) => (child.session?.totalReasoningTokens ?? 0) + (child.active?.reasoningTokens ?? 0)
+    );
 
   const lastData = active ?? lastRequest;
-  const isActive = Boolean(active);
+  const isActive = active !== undefined || childList.some((child) => child.active !== undefined);
 
   const lastTotalDuration = active ? active.elapsedMs : (lastRequest?.totalDurationMs ?? 0);
   const lastToolExecutionMs = active ? active.toolExecutionMs : (lastRequest?.toolExecutionMs ?? 0);
@@ -274,9 +325,7 @@ export function TimingPanel(props: TimingPanelProps) {
 
   const totalTokensForView = (() => {
     if (viewMode === "session") {
-      const output = session?.totalOutputTokens ?? 0;
-      const reasoning = session?.totalReasoningTokens ?? 0;
-      return output + reasoning;
+      return sessionOutputTokens + sessionReasoningTokens;
     }
     const output = lastData?.outputTokens ?? 0;
     const reasoning = lastData?.reasoningTokens ?? 0;
@@ -354,19 +403,19 @@ export function TimingPanel(props: TimingPanelProps) {
             </div>
           )}
 
-          {viewMode === "session" && session && session.responseCount > 0 && (
+          {viewMode === "session" && sessionResponseCount > 0 && (
             <div className="text-muted-light flex flex-wrap gap-x-3 gap-y-1 text-xs">
               <span>
-                {session.responseCount} response{session.responseCount !== 1 ? "s" : ""}
+                {sessionResponseCount} response{sessionResponseCount !== 1 ? "s" : ""}
               </span>
-              {(session.totalOutputTokens > 0 || session.totalReasoningTokens > 0) && (
+              {(sessionOutputTokens > 0 || sessionReasoningTokens > 0) && (
                 <>
                   <span>·</span>
-                  <span>{formatTokens(session.totalOutputTokens)} output tokens</span>
-                  {session.totalReasoningTokens > 0 && (
+                  <span>{formatTokens(sessionOutputTokens)} output tokens</span>
+                  {sessionReasoningTokens > 0 && (
                     <>
                       <span>·</span>
-                      <span>{formatTokens(session.totalReasoningTokens)} thinking</span>
+                      <span>{formatTokens(sessionReasoningTokens)} thinking</span>
                     </>
                   )}
                 </>
@@ -444,15 +493,107 @@ export interface ModelBreakdownPanelProps {
   workspaceId: string;
 }
 
+/** Additive fields a per-model row accumulates. */
+interface ModelRowDelta {
+  totalDurationMs: number;
+  totalToolExecutionMs: number;
+  totalStreamingMs: number;
+  totalTtftMs: number;
+  ttftCount: number;
+  responseCount: number;
+  totalOutputTokens: number;
+  totalReasoningTokens: number;
+}
+
+function addModelRow(
+  rows: Map<string, ModelBreakdownEntry>,
+  identity: { model: string; mode?: string; agentId?: string },
+  delta: ModelRowDelta
+): void {
+  const key = getModelTimingKey(identity.model, identity.mode, identity.agentId);
+  const existing = rows.get(key);
+  if (!existing) {
+    rows.set(key, {
+      key,
+      model: identity.model,
+      mode: identity.mode,
+      agentId: identity.agentId,
+      ...delta,
+    });
+    return;
+  }
+
+  existing.totalDurationMs += delta.totalDurationMs;
+  existing.totalToolExecutionMs += delta.totalToolExecutionMs;
+  existing.totalStreamingMs += delta.totalStreamingMs;
+  existing.totalTtftMs += delta.totalTtftMs;
+  existing.ttftCount += delta.ttftCount;
+  existing.responseCount += delta.responseCount;
+  existing.totalOutputTokens += delta.totalOutputTokens;
+  existing.totalReasoningTokens += delta.totalReasoningTokens;
+}
+
+/**
+ * The live stream as a row delta. It contributes exactly what the completion will persist
+ * (`applyCompletedStreamToFile`), so the row keeps its value when the stream ends.
+ */
+function activeRowDelta(active: ActiveStreamStats): ModelRowDelta {
+  return {
+    totalDurationMs: active.elapsedMs,
+    totalToolExecutionMs: active.toolExecutionMs,
+    totalStreamingMs: active.streamingMs,
+    totalTtftMs: active.ttftMs ?? 0,
+    ttftCount: active.ttftMs !== null ? 1 : 0,
+    responseCount: 1,
+    totalOutputTokens: active.outputTokens,
+    totalReasoningTokens: active.reasoningTokens,
+  };
+}
+
+/**
+ * Persisted rows plus the live stream and sub-agent workspaces.
+ *
+ * Sub-agent timing lives in the child's own session file until its removal rolls it into this
+ * workspace, so the snapshot carries it separately (`children`); folding it in additively
+ * shows sub-agent work live without double counting once the roll-up lands.
+ *
+ * Exported for unit tests.
+ */
+export function buildModelEntries(input: {
+  session?: SessionTimingStats;
+  active?: ActiveStreamStats;
+  children?: ChildWorkspaceStats[];
+}): ModelBreakdownEntry[] {
+  const rows = new Map<string, ModelBreakdownEntry>();
+  for (const [key, entry] of Object.entries(input.session?.byModel ?? {})) {
+    rows.set(key, { key, ...entry });
+  }
+
+  for (const child of input.children ?? []) {
+    for (const entry of Object.values(child.session?.byModel ?? {})) {
+      addModelRow(rows, entry, entry);
+    }
+    if (child.active) {
+      addModelRow(rows, child.active, activeRowDelta(child.active));
+    }
+  }
+
+  if (input.active) {
+    addModelRow(rows, input.active, activeRowDelta(input.active));
+  }
+
+  return Array.from(rows.values());
+}
+
 /**
  * Standalone Model Breakdown panel for the Stats sub-tab.
  * Shows per-model timing/token statistics with optional agent split.
  */
 export function ModelBreakdownPanel(props: ModelBreakdownPanelProps) {
   const data = useStatsData(props.workspaceId);
-  const { session, hasAnyData, showModeBreakdown, setShowModeBreakdown } = data;
+  const { hasAnyData, showModeBreakdown, setShowModeBreakdown } = data;
 
-  if (!hasAnyData || !session) {
+  if (!hasAnyData) {
     return (
       <div className="text-light font-primary text-[13px] leading-relaxed">
         <div className="text-secondary px-5 py-10 text-center">
@@ -463,9 +604,11 @@ export function ModelBreakdownPanel(props: ModelBreakdownPanelProps) {
     );
   }
 
-  const modelEntries: ModelBreakdownEntry[] = Object.entries(session.byModel).map(
-    ([key, entry]) => ({ key, ...entry })
-  );
+  const modelEntries = buildModelEntries({
+    session: data.session,
+    active: data.active,
+    children: data.children,
+  });
 
   const hasSplitData = modelEntries.some((e) => e.agentId !== undefined || e.mode !== undefined);
 

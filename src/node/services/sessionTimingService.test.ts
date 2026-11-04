@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 
@@ -612,6 +612,94 @@ describe("SessionTimingService", () => {
       service.offStatsChange(onChange);
       service.removeSubscriber(workspaceId);
     }
+  });
+
+  describe("sub-agent (descendant workspace) timing", () => {
+    const PARENT = "parent-workspace";
+    const CHILD = "child-workspace";
+
+    /** Register the parent-child link the way config metadata does in production. */
+    function linkParentToChild(): void {
+      const realFindWorkspace = config.findWorkspace.bind(config) as (
+        workspaceId: string
+      ) => { workspacePath: string; projectPath: string; parentWorkspaceId?: string } | null;
+      spyOn(config, "findWorkspace").mockImplementation(((workspaceId: string) => {
+        if (workspaceId === PARENT) {
+          return { workspacePath: "/tmp/parent", projectPath: "/tmp" };
+        }
+        if (workspaceId === CHILD) {
+          return { workspacePath: "/tmp/child", projectPath: "/tmp", parentWorkspaceId: PARENT };
+        }
+        return realFindWorkspace(workspaceId);
+      }) as typeof config.findWorkspace);
+      service.setDescendantsProvider((workspaceId) =>
+        workspaceId === PARENT ? [{ workspaceId: CHILD, title: "Sub agent" }] : []
+      );
+    }
+
+    it("folds a completed sub-agent request into the parent snapshot", async () => {
+      linkParentToChild();
+      emitCompletedStreamWithOneTool({ workspaceId: CHILD, model: "openai:gpt-4o" });
+      await service.waitForIdle(CHILD);
+
+      const snapshot = await service.getSnapshot(PARENT);
+
+      // The parent itself has run nothing; the child's request must not leak into its totals.
+      expect(snapshot.session?.responseCount).toBe(0);
+      expect(snapshot.children).toHaveLength(1);
+      expect(snapshot.children?.[0].workspaceId).toBe(CHILD);
+      expect(snapshot.children?.[0].title).toBe("Sub agent");
+      expect(snapshot.children?.[0].session?.responseCount).toBe(1);
+      expect(snapshot.children?.[0].session?.byModel["openai:gpt-4o:exec"]?.responseCount).toBe(1);
+      expect(snapshot.children?.[0].active).toBeUndefined();
+    });
+
+    it("includes a running sub-agent stream so its row advances live", async () => {
+      linkParentToChild();
+      emitStreamStart({ workspaceId: CHILD, startTime: 2_000_000 });
+      emitStreamDelta({ workspaceId: CHILD, tokens: 7, timestamp: 2_000_100 });
+
+      const snapshot = await service.getSnapshot(PARENT);
+
+      expect(snapshot.children?.[0].active).toMatchObject({
+        model: normalizeToCanonical("openai:gpt-4o"),
+        outputTokens: 7,
+      });
+      expect(snapshot.children?.[0].session).toBeUndefined();
+    });
+
+    it("skips a sub-agent already merged into the parent on removal", async () => {
+      linkParentToChild();
+      emitCompletedStreamWithOneTool({ workspaceId: CHILD, model: "openai:gpt-4o" });
+      await service.waitForIdle(CHILD);
+
+      await service.rollUpTimingIntoParent(PARENT, CHILD);
+
+      const snapshot = await service.getSnapshot(PARENT);
+      expect(snapshot.session?.responseCount).toBe(1);
+      // Already in the parent totals above: listing the child again would double count.
+      expect(snapshot.children).toBeUndefined();
+    });
+
+    it("wakes the parent's subscribers for a sub-agent stream", () => {
+      linkParentToChild();
+      const onChange = mock<(workspaceId: string) => void>(() => undefined);
+      service.onStatsChange(onChange);
+      // Only the parent's Stats tab is open.
+      service.addSubscriber(PARENT);
+
+      try {
+        emitStreamStart({ workspaceId: CHILD, startTime: 3_000_000 });
+        expect(onChange.mock.calls.map((call) => call[0])).toContain(PARENT);
+
+        onChange.mockClear();
+        emitStreamDelta({ workspaceId: CHILD, tokens: 1, timestamp: 3_000_100 });
+        expect(onChange.mock.calls.map((call) => call[0])).toContain(PARENT);
+      } finally {
+        service.offStatsChange(onChange);
+        service.removeSubscriber(PARENT);
+      }
+    });
   });
 
   it("clears scheduled delta emits when the last subscriber disconnects", async () => {

@@ -8794,6 +8794,72 @@ describe("WorkspaceStore", () => {
       });
     });
 
+    it("recounts after a finished step even when the step ran no tool call", async () => {
+      const workspaceId = "consumers-usage-delta";
+      const events = createControllableAsyncIterable<WorkspaceChatMessage>();
+      mockOnChat.mockImplementation(async function* (input, options) {
+        if (input?.workspaceId !== workspaceId) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        options?.signal?.addEventListener("abort", () => events.close(), { once: true });
+        yield* events.iterable;
+      });
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? {
+                byModel: {},
+                tokenStatsCache: tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }),
+                version: 1 as const,
+              }
+            : undefined
+        )
+      );
+
+      createAndAddWorkspace(store, workspaceId);
+      events.push(createHistoryMessageEvent("user-1", 3));
+      events.push({
+        type: "message",
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "reply" }],
+        metadata: { historySequence: 7, timestamp: 7, model: MODEL },
+      });
+      events.push(caughtUpEvent());
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+      // The cached breakdown still matches the history, so nothing is pending yet.
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(false);
+
+      // The recount goes through the backend tokenizer; hold it open so the request itself is
+      // what we assert on (a fast failure would reset the pending state immediately).
+      const calculateStats = mock(
+        (_input: { workspaceId: string; model: string }) => new Promise<never>(() => undefined)
+      );
+      const orpcWindow = window as unknown as { __ORPC_CLIENT__?: unknown };
+      const previousClient = orpcWindow.__ORPC_CLIENT__;
+      orpcWindow.__ORPC_CLIENT__ = { tokenizer: { calculateStats } };
+
+      try {
+        // usage-delta marks a finished step. Steps without tool calls have no other trigger,
+        // so this is what keeps the Context tab's counts advancing during a turn.
+        events.push({
+          type: "usage-delta",
+          workspaceId,
+          messageId: "assistant-1",
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          cumulativeUsage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        });
+
+        expect(await waitUntil(() => calculateStats.mock.calls.length > 0)).toBe(true);
+        expect(calculateStats.mock.calls[0][0]).toMatchObject({ workspaceId });
+      } finally {
+        orpcWindow.__ORPC_CLIENT__ = previousClient;
+      }
+    });
+
     it("recounts when the newest history sequence differs from the cached one", async () => {
       // Same message count, but the history changed: the cache saw sequence 5 as newest.
       const workspaceId = "consumers-cache-stale-sequence";

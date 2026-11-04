@@ -1454,6 +1454,10 @@ export class WorkspaceStore {
     "usage-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.usageStore.bump(workspaceId);
+      // A step finished (usage-delta is per step): re-tokenize so the Context tab's file and
+      // consumer counts advance even on steps that produced no tool calls. The manager's
+      // debounce coalesces bursts and replay seeding into one calculation.
+      this.consumerManager.scheduleCalculation(workspaceId, aggregator);
     },
     "init-start": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);

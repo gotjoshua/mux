@@ -15,6 +15,7 @@ import {
 } from "@/common/orpc/schemas/workspaceStats";
 import type {
   ActiveStreamStats,
+  ChildWorkspaceStats,
   CompletedStreamStats,
   SessionTimingFile,
   TimingAnomaly,
@@ -35,6 +36,7 @@ import { log } from "./log";
 import type { TelemetryService } from "./telemetryService";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getModelTimingKey } from "@/common/utils/modelTimingKey";
 
 const SESSION_TIMING_FILE = "session-timing.json";
 const SESSION_TIMING_VERSION = 2 as const;
@@ -43,6 +45,12 @@ const SESSION_TIMING_VERSION = 2 as const;
 // unnecessary pressure throughout the backend. We rate-limit delta-driven change events
 // per-workspace.
 const DELTA_EMIT_THROTTLE_MS = 100;
+
+/** Minimal descendant reference the snapshot needs; taskService rows satisfy it structurally. */
+export interface DescendantWorkspaceRef {
+  workspaceId: string;
+  title?: string;
+}
 
 interface ActiveStreamState {
   workspaceId: string;
@@ -70,11 +78,6 @@ interface ActiveStreamState {
   deltaStorage: DeltaRecordStorage;
 
   lastEventTimestampMs: number;
-}
-
-function getModelKey(model: string, mode: AgentMode | undefined, agentId?: string): string {
-  if (agentId) return `${model}:${agentId}`;
-  return mode ? `${model}:${mode}` : model;
 }
 
 function createEmptyTimingFile(): SessionTimingFile {
@@ -183,6 +186,12 @@ export class SessionTimingService {
     { lastEmitTimeMs: number; timer?: ReturnType<typeof setTimeout> }
   >();
 
+  /**
+   * Descendant (sub-agent) workspaces of a workspace. Wired post-construction because the
+   * task service is built after this one.
+   */
+  private descendantsProvider: ((workspaceId: string) => DescendantWorkspaceRef[]) | undefined;
+
   constructor(
     config: Config,
     telemetryService: TelemetryService,
@@ -191,6 +200,14 @@ export class SessionTimingService {
     this.config = config;
     this.telemetryService = telemetryService;
     this.fileLocks = locks.workspaceFiles;
+  }
+
+  /**
+   * Stats panels show sub-agent (descendant workspace) timing in the ancestor's snapshot, so
+   * the provider must list every descendant workspace below the given one.
+   */
+  setDescendantsProvider(provider: (workspaceId: string) => DescendantWorkspaceRef[]): void {
+    this.descendantsProvider = provider;
   }
 
   addSubscriber(workspaceId: string): void {
@@ -227,10 +244,46 @@ export class SessionTimingService {
 
   private emitChange(workspaceId: string): void {
     // Only wake subscribers if anyone is listening for this workspace.
-    if ((this.subscriberCounts.get(workspaceId) ?? 0) === 0) {
-      return;
+    if ((this.subscriberCounts.get(workspaceId) ?? 0) > 0) {
+      this.emitter.emit("change", workspaceId);
     }
-    this.emitter.emit("change", workspaceId);
+    this.emitAncestorChange(workspaceId);
+  }
+
+  /**
+   * A descendant's stream changes the ancestor's snapshot too (children are folded into it),
+   * so wake the ancestors as well. The parent link lives in config metadata; a malformed
+   * persisted ancestry (cycle) must not hang the walk.
+   */
+  private emitAncestorChange(workspaceId: string): void {
+    const visited = new Set<string>([workspaceId]);
+    let current = workspaceId;
+    for (;;) {
+      const parent = this.config.findWorkspace(current)?.parentWorkspaceId;
+      if (!parent || visited.has(parent)) return;
+      visited.add(parent);
+      current = parent;
+      if ((this.subscriberCounts.get(parent) ?? 0) > 0) {
+        this.emitter.emit("change", parent);
+      }
+    }
+  }
+
+  /**
+   * True when this workspace or any ancestor has a Stats subscriber: ancestor snapshots fold
+   * descendants in, so a child stream must still drive pushes when only the parent is open.
+   */
+  private hasInterestedSubscribers(workspaceId: string): boolean {
+    if ((this.subscriberCounts.get(workspaceId) ?? 0) > 0) return true;
+    const visited = new Set<string>([workspaceId]);
+    let current = workspaceId;
+    for (;;) {
+      const parent = this.config.findWorkspace(current)?.parentWorkspaceId;
+      if (!parent || visited.has(parent)) return false;
+      visited.add(parent);
+      current = parent;
+      if ((this.subscriberCounts.get(parent) ?? 0) > 0) return true;
+    }
   }
 
   private clearDeltaEmitState(workspaceId: string): void {
@@ -247,8 +300,8 @@ export class SessionTimingService {
   }
 
   private emitDeltaChangeImmediate(workspaceId: string): void {
-    // Avoid allocating timers/state when nothing is subscribed.
-    if ((this.subscriberCounts.get(workspaceId) ?? 0) === 0) {
+    // Avoid allocating timers/state when no snapshot (own or ancestor) includes this stream.
+    if (!this.hasInterestedSubscribers(workspaceId)) {
       return;
     }
 
@@ -262,8 +315,8 @@ export class SessionTimingService {
   }
 
   private emitDeltaChangeThrottled(workspaceId: string): void {
-    // Avoid allocating timers/state when nothing is subscribed.
-    if ((this.subscriberCounts.get(workspaceId) ?? 0) === 0) {
+    // Avoid allocating timers/state when no snapshot (own or ancestor) includes this stream.
+    if (!this.hasInterestedSubscribers(workspaceId)) {
       return;
     }
 
@@ -301,8 +354,8 @@ export class SessionTimingService {
 
       currentState.timer = undefined;
 
-      // If there are no subscribers anymore, clean up.
-      if ((this.subscriberCounts.get(workspaceId) ?? 0) === 0) {
+      // If no snapshot includes this stream anymore, clean up.
+      if (!this.hasInterestedSubscribers(workspaceId)) {
         this.deltaEmitState.delete(workspaceId);
         return;
       }
@@ -392,7 +445,7 @@ export class SessionTimingService {
     file.session.totalOutputTokens += completed.outputTokens;
     file.session.totalReasoningTokens += completed.reasoningTokens;
 
-    const key = getModelKey(completed.model, completed.mode, completed.agentId);
+    const key = getModelTimingKey(completed.model, completed.mode, completed.agentId);
     const existing = file.session.byModel[key];
     const base = existing ?? {
       model: completed.model,
@@ -581,7 +634,7 @@ export class SessionTimingService {
       parentTiming.session.totalReasoningTokens += childTiming.session.totalReasoningTokens;
 
       for (const childEntry of Object.values(childTiming.session.byModel)) {
-        const key = getModelKey(childEntry.model, childEntry.mode, childEntry.agentId);
+        const key = getModelTimingKey(childEntry.model, childEntry.mode, childEntry.agentId);
         const existing = parentTiming.session.byModel[key];
         const base = existing ?? {
           model: childEntry.model,
@@ -701,6 +754,7 @@ export class SessionTimingService {
   async getSnapshot(workspaceId: string): Promise<WorkspaceStatsSnapshot> {
     const file = await this.getCachedTimingFile(workspaceId);
     const active = this.getActiveStreamStats(workspaceId);
+    const children = await this.getChildrenStats(workspaceId, file);
 
     return {
       workspaceId,
@@ -708,7 +762,46 @@ export class SessionTimingService {
       active,
       lastRequest: file.lastRequest,
       session: file.session,
+      children,
     };
+  }
+
+  /**
+   * Timing of descendant (sub-agent) workspaces, folded into this workspace's snapshot so the
+   * Stats panels show sub-agent rows while they run.
+   *
+   * A child already present in this file's `rolledUpFrom` ledger was merged into the session
+   * totals on removal; listing it again would double count until its removal finishes.
+   */
+  private async getChildrenStats(
+    workspaceId: string,
+    parentFile: SessionTimingFile
+  ): Promise<ChildWorkspaceStats[] | undefined> {
+    const descendants = this.descendantsProvider?.(workspaceId);
+    if (!descendants || descendants.length === 0) return undefined;
+
+    const seen = new Set<string>();
+    const children: ChildWorkspaceStats[] = [];
+    for (const ref of descendants) {
+      const childId = ref.workspaceId;
+      if (childId === workspaceId || seen.has(childId)) continue;
+      seen.add(childId);
+      if (parentFile.rolledUpFrom?.[childId]) continue;
+
+      const childFile = await this.getCachedTimingFile(childId);
+      const childActive = this.getActiveStreamStats(childId);
+      const hasSession = childFile.session.responseCount > 0;
+      if (!hasSession && !childActive) continue;
+
+      children.push({
+        workspaceId: childId,
+        title: ref.title,
+        active: childActive,
+        session: hasSession ? childFile.session : undefined,
+      });
+    }
+
+    return children.length > 0 ? children : undefined;
   }
 
   // --- Stream event handlers (wired from AIService) ---

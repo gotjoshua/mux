@@ -711,6 +711,11 @@ export const DesktopWiringLive: Layer.Layer<
     workspaceService.setRefinePassCanceller(refineService);
     workspaceService.setTimelineRecorder(timelineService);
     taskService.setTimelineRecorder(timelineService);
+    // Stats panels fold sub-agent (descendant workspace) timing into the ancestor's snapshot,
+    // so sub-agents are visible in the parent's Models/Timing tabs while they run.
+    sessionTimingService.setDescendantsProvider((workspaceId) =>
+      taskService.listWorkspaceRemovalDescendants(workspaceId)
+    );
     heartbeatService.setTimelineRecorder(timelineService);
     workspaceGoalService.setTimelineRecorder(timelineService);
     // Artifacts goal status board: the host keeps goal.status.html current at goal events,
