@@ -844,7 +844,9 @@ export const router = (authToken?: string) => {
       deleteCreation: t
         .input(schemas.drafts.deleteCreation.input)
         .output(schemas.drafts.deleteCreation.output)
-        .handler(({ context, input }) => context.draftService.creation.delete(input.scope.draftId)),
+        .handler(({ context, input }) =>
+          context.draftService.creation.delete(input.scope.draftId, input.ifStored)
+        ),
       importLegacyCreation: t
         .input(schemas.drafts.importLegacyCreation.input)
         .output(schemas.drafts.importLegacyCreation.output)
@@ -2151,7 +2153,7 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.preflightArchive.input)
         .output(schemas.workspace.preflightArchive.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.preflightArchive(input.workspaceId)
+          context.workspaceService.preflightArchiveWithSubagents(input.workspaceId)
         ),
       archive: t
         .input(schemas.workspace.archive.input)
@@ -2159,7 +2161,8 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.archive(
             input.workspaceId,
-            input.acknowledgedUntrackedPaths ?? undefined
+            input.acknowledgedUntrackedPaths ?? undefined,
+            { acknowledgedSubagentUntrackedPaths: input.acknowledgedSubagentUntrackedPaths }
           )
         ),
       unarchive: t
@@ -2571,6 +2574,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.getSessionUsage.output)
         .handler(async ({ context, input }) =>
           context.sessionUsageService.getSessionUsage(input.workspaceId)
+        ),
+      getSubagentUsage: t
+        .input(schemas.workspace.getSubagentUsage.input)
+        .output(schemas.workspace.getSubagentUsage.output)
+        .handler(async ({ context, input }) =>
+          context.sessionUsageService.getOpenSubagentUsage(input.workspaceId)
         ),
       getSessionUsageBatch: t
         .input(schemas.workspace.getSessionUsageBatch.input)

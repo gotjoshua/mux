@@ -2262,6 +2262,13 @@ export interface WorkspaceServiceEvents {
     removedParentWorkspaceId?: string;
   }) => void;
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
+  /**
+   * A write changed the workspace's session usage (SessionUsageService.onUsageChanged), so a
+   * renderer refetches it and its ancestors' sub-agent projections. A session-usage-delta
+   * reaches only a live session's subscribed chat, and nothing else announces a sub-agent's
+   * in-flight or headless spend.
+   */
+  "usage-changed": (event: { workspaceId: string }) => void;
   /** Request an incremental analytics ingest outside the stream-end path. */
   analyticsIngest: (event: { workspaceId: string }) => void;
   /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
@@ -2897,6 +2904,9 @@ export class WorkspaceService
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
+    this.sessionUsageService?.onUsageChanged((workspaceId) =>
+      this.emit("usage-changed", { workspaceId })
+    );
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
     // A cleared tombstone means a removed id was re-registered (downgraded
@@ -5276,6 +5286,9 @@ export class WorkspaceService
         this.sendPreflight.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
+      isWorkspaceTurnStopped: async (correlation) =>
+        (await this.agentTaskIntegration?.isWorkspaceTurnStopped(workspaceId, correlation)) ===
+        true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
       onBeforeTurnCompletion: async () => {
         await this.agentTaskIntegration?.acknowledgeAgentReports(workspaceId);
@@ -11552,6 +11565,30 @@ export class WorkspaceService
   }
 
   /**
+   * The user's archive preflight. It adds the untracked files each sub-agent's snapshot archive
+   * would lose to the target's own, so one dialog confirms the whole cascade: without them the
+   * archive refuses at the first lossy sub-agent and the user has no way to confirm it.
+   */
+  async preflightArchiveWithSubagents(
+    workspaceId: string
+  ): Promise<Result<ArchivePreflightResult>> {
+    const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+    // A "delete" archive snapshots nothing, and the cascade preflight refuses it for the
+    // model-facing caller only.
+    if (
+      worktreeArchiveBehavior === "delete" ||
+      this.listUnarchivedDescendants(workspaceId).length === 0
+    ) {
+      return await this.preflightArchive(workspaceId);
+    }
+    const cascade = await this.preflightArchiveCascade(workspaceId, worktreeArchiveBehavior);
+    if (!cascade.success) return Err(cascade.error);
+    const { targetPaths, subagents } = cascade.data;
+    if (targetPaths.length === 0 && subagents.length === 0) return Ok({ kind: "ready" });
+    return Ok({ kind: "confirm-lossy-untracked-files", paths: targetPaths, subagents });
+  }
+
+  /**
    * #4477: archiving a parent archives its unarchived sub-agents first, deepest-first, with the
    * parent's worktree archive behavior: "keep" archives them without touching their checkouts,
    * "delete" deletes their checkouts, "snapshot" snapshots them. The Coder archive policy applies
@@ -11732,22 +11769,11 @@ export class WorkspaceService
     const archivedDescendantIds: string[] = [];
     try {
       for (const descendant of descendants) {
-        const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
-          // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
-          // user-facing archive passes none of them.
-          forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
-          refuseLiveUserActivity: options?.refuseLiveUserActivity,
-          forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
-          worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
-          coderWorkspaceArchiveBehaviorOverride: "keep",
-          mutationGateHeld: true,
-        });
-        const failure = !result.success
-          ? result.error
-          : result.data.kind !== "archived"
-            ? // Its untracked files need their own confirmation: the parent's does not cover them.
-              "its untracked files would be lost by the snapshot archive; archive it on its own to review them"
-            : null;
+        const failure = await this.archiveCascadeDescendant(
+          descendant.workspaceId,
+          worktreeArchiveBehavior,
+          options
+        );
         if (failure != null) {
           return Err(
             `Cannot archive sub-agent ${descendant.title} (${descendant.workspaceId}): ${failure}`
@@ -11773,6 +11799,37 @@ export class WorkspaceService
       // The task-tree lock remains held, so nested removal must not reacquire that lock.
       for (const id of archivedDescendantIds) await this.removeSideChatsOf(id, true);
     }
+  }
+
+  /**
+   * Archive one sub-agent of a cascade under the tree's held gate and pinned behavior. Returns
+   * why it refused, or null once it is archived.
+   */
+  private async archiveCascadeDescendant(
+    descendantId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options: ArchiveWorkspaceOptions | undefined
+  ): Promise<string | null> {
+    const result = await this.archiveUnlocked(
+      descendantId,
+      options?.acknowledgedSubagentUntrackedPaths?.[descendantId],
+      {
+        // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
+        // user-facing archive passes none of them.
+        forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+        refuseLiveUserActivity: options?.refuseLiveUserActivity,
+        forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
+        worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+        coderWorkspaceArchiveBehaviorOverride: "keep",
+        mutationGateHeld: true,
+      }
+    );
+    if (!result.success) return result.error;
+    // Untracked files that the user did not confirm (or that appeared after the confirmation)
+    // refuse; the dialog's retry preflights again and lists them.
+    return result.data.kind === "archived"
+      ? null
+      : "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them";
   }
 
   /**
@@ -20589,6 +20646,19 @@ export class WorkspaceService
   /** Cancel the workspace session's scheduled auto-retry of this goal's automatic turn. */
   abandonGoalAutoRetry(workspaceId: string, goalId: string): void {
     this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
+  }
+
+  abandonAutoRetry(workspaceId: string, reason: string): void {
+    // Stop paths call this right before their stream stop: a throw must not skip that stop.
+    // A session still in its startup recovery is not registered yet, and that recovery can arm
+    // the stopped turn again.
+    try {
+      (
+        this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId)
+      )?.abandonAutoRetry(reason);
+    } catch (error: unknown) {
+      log.warn("abandonAutoRetry failed", { workspaceId, reason, error: getErrorMessage(error) });
+    }
   }
 
   async getGoalContinuationKickoffSendOptions(

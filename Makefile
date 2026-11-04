@@ -42,6 +42,59 @@ XUM_VITE_ALLOWED_HOSTS ?= $(or $(MUX_VITE_ALLOWED_HOSTS),$(VITE_ALLOWED_HOSTS))
 XUM_BACKEND_HOST ?= $(or $(MUX_BACKEND_HOST),$(BACKEND_HOST),127.0.0.1)
 XUM_BACKEND_PORT ?= $(or $(MUX_BACKEND_PORT),$(BACKEND_PORT),3000)
 
+# `make dev-server` starts the backend with auth on: any local account can reach a loopback port,
+# and an open backend runs commands as you. Make generates one random token per run, so nodemon
+# restarts keep it, and exports it to the recipe's processes. It stays in the environment (argv is
+# visible to every local account) and in <XUM_ROOT>/server.lock (mode 0600). The browser sends it
+# through the Vite proxy as `/?token=<token>` once; the proxy adds nothing, so the Vite port is no
+# way around auth. XUM_DEV_SERVER_AUTH_TOKEN picks the token. The ambient XUM_SERVER_AUTH_TOKEN is
+# never reused: agent shells export the real server's token. XUM_DEV_SERVER_NO_AUTH=1 restores the
+# open backend, for hosts where you are the only account. Keep XUM_ROOT outside the checkout: Vite
+# serves the checkout to anyone who can reach its port, and public/ without any file checks.
+ifeq ($(XUM_DEV_SERVER_NO_AUTH),1)
+override DEV_SERVER_AUTH_FLAG := --no-auth
+else
+override DEV_SERVER_AUTH_FLAG :=
+# Only when dev-server is a goal: `:=` runs node at parse time, and every make invocation parses this.
+ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
+# `override` beats `make -e`; `$(value ...)` keeps a chosen token's dollar signs from being expanded.
+override export XUM_SERVER_AUTH_TOKEN := $(or $(value XUM_DEV_SERVER_AUTH_TOKEN),$(shell node -p "require('crypto').randomBytes(32).toString('hex')"))
+ifeq ($(XUM_SERVER_AUTH_TOKEN),)
+$(error could not generate the dev-server auth token: is node on PATH?)
+endif
+endif
+endif
+
+# While nodemon restarts the backend, its TCP port is free for any local account to bind, and the
+# browser's reconnect URL carries the token. So Vite reaches the backend over a Unix socket in a
+# private folder (`xum server --unix-socket` makes it 0700 and refuses a folder that is not yours):
+# no other account can create the socket's name. The TCP port stays for the CLI and scripts, which
+# read the lockfile. The path is short on purpose (sun_path holds about 100 bytes) and has the
+# backend host and port in its name (a TCP address can be bound once, so no two running backends
+# share it), so parallel dev servers do not collide. XUM_BACKEND_SOCKET picks another.
+# The recipe reads the path from the environment (`"$XUM_BACKEND_SOCKET"`), never from the command
+# text: it crosses three shells, and a path with spaces or quotes must stay one argument.
+# Windows has no such folder and keeps TCP for the Vite hop.
+ifneq ($(OS),Windows_NT)
+ifneq ($(filter dev-server,$(MAKECMDGOALS)),)
+ifndef XUM_BACKEND_SOCKET
+# scripts/devServerSocketPath.ts: another account can create the default folder first, and the
+# backend refuses a folder that is not ours, so a folder that is not safely ours is replaced by a
+# fresh private one next to it (and says so). It creates the folder (0700) when it is missing, so
+# that no other account takes the name while make builds, and a dry run does the same.
+shq = '$(subst ','\'',$(1))'
+XUM_BACKEND_SOCKET := $(shell bun scripts/devServerSocketPath.ts $(call shq,$(or $(XDG_RUNTIME_DIR),/tmp)/xum-dev-$(shell id -u)) $(call shq,b$(XUM_BACKEND_PORT)-$(subst /,_,$(subst :,_,$(XUM_BACKEND_HOST))).sock))
+ifeq ($(XUM_BACKEND_SOCKET),)
+$(error no private folder for the dev-server socket (the reason is above, or bun is not on PATH): set XUM_BACKEND_SOCKET to a socket path in a folder that only you can write to, or XDG_RUNTIME_DIR to such a folder)
+endif
+endif
+export XUM_BACKEND_SOCKET
+endif
+else
+# The Windows recipe starts the backend on TCP only: an ambient path must not reach the Vite proxy.
+override XUM_BACKEND_SOCKET :=
+endif
+
 # Use PATH-resolved bash for portability across different systems.
 # - Windows: /usr/bin/bash doesn't exist in Chocolatey's make environment or GitHub Actions
 # - NixOS: /bin/bash doesn't exist, bash is in /nix/store/...
@@ -92,6 +145,7 @@ include fmt.mk
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
+.PHONY: formal-check
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-host-proof test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
@@ -189,26 +243,29 @@ dev-server: node_modules/.installed build-main ## Start server mode with hot rel
 	@echo "Starting dev-server..."
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
+	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# On Windows, use npm run because bunx doesn't correctly pass arguments
 	@npm x concurrently -k \
 		"nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules scripts/build-main-watch.js" \
 		'npx esbuild src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)" \
+		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)" \
 		"set XUM_VITE_HOST=$(XUM_VITE_HOST)&& set XUM_VITE_PORT=$(XUM_VITE_PORT)&& set XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS)&& set XUM_BACKEND_HOST=$(XUM_BACKEND_HOST)&& set XUM_BACKEND_PORT=$(XUM_BACKEND_PORT)&& vite"
 else
 dev-server: node_modules/.installed build-main ## Start server mode with hot reload. Use XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host> for remote access
 	@echo "Starting dev-server..."
 	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
 	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
+	@echo "  Auth:                    $(if $(DEV_SERVER_AUTH_FLAG),DISABLED (XUM_DEV_SERVER_NO_AUTH=1). Any local account can control this backend.,token required (not printed). It is in server.lock under XUM_ROOT. Open the frontend with /?token=<token>.)"
+	@echo "  Vite -> backend:         Unix socket $$XUM_BACKEND_SOCKET"
 	@echo ""
 	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# Keep tsgo -> tsc-alias sequential to avoid transient unresolved @/ imports in dist during restarts.
 	@bun x concurrently -k \
 		"bun x nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules --exec 'node scripts/build-main-watch.js'" \
 		'$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
+		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server $(DEV_SERVER_AUTH_FLAG) --unix-socket \"\$$XUM_BACKEND_SOCKET\" --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
 		"XUM_VITE_HOST=$(XUM_VITE_HOST) XUM_VITE_PORT=$(XUM_VITE_PORT) XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS) XUM_BACKEND_HOST=$(XUM_BACKEND_HOST) XUM_BACKEND_PORT=$(XUM_BACKEND_PORT) vite"
 endif
 
@@ -611,6 +668,9 @@ test-mutate-scripts: tree-sitter-grammars ## Test the mutation runner and mutate
 	@$(MUTATE_PYTHON) -m pytest -q -p no:cacheprovider scripts/mutate/mutate_report_test.py
 	@bun test ./scripts/mutate/check.test.ts
 
+formal-check: ## Model-check that a Stop ends the auto-retry loop (TLA+/TLC, Java 11+; see .xum/skills/formal-stop-retry)
+	@./.xum/skills/formal-stop-retry/check.sh
+
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
 
@@ -725,15 +785,19 @@ check-deadcode: node_modules/.installed ## Check for potential dead code (manual
 		|| echo "✓ No obvious dead code found"
 
 ## Testing
-.PHONY: test-codex-comments test-pr-checks test-required-superseded
+.PHONY: test-codex-comments test-pr-checks test-required-superseded test-branch-sync-guard
 test-codex-comments: ## Test Codex comment gates with offline GitHub fixtures
 	@python3 scripts/check_codex_comments_test.py
 
-test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fixtures
+test-pr-checks: ## Test PR check discovery, readiness and the PR state watcher with offline GitHub fixtures
 	@python3 scripts/pr_checks_test.py
+	@python3 scripts/watch_pr_state_test.py
 
 test-required-superseded: ## Test the Required stand-down decision for cancelled duplicate PR runs
 	@python3 scripts/required_superseded_test.py
+
+test-branch-sync-guard: ## Test the wait_pr_* checkout guard against real git clones with offline GitHub fixtures
+	@python3 scripts/branch_sync_guard_test.py
 
 test-integration: node_modules/.installed build-main ## Run all tests (unit + integration)
 	@bun test src

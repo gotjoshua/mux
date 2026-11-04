@@ -5,6 +5,10 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import { Config } from "@/node/config";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
+import { getAgentAiSettingsBases } from "@/common/utils/ai/agentAncestorLayers";
+import { resolveAgentCacheTtl } from "@/common/utils/ai/resolveAgentAiSettings";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
@@ -27,6 +31,7 @@ import {
 } from "./agentDefinitionsService";
 import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
 import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
+import { resolveChainAgentCacheTtl } from "./resolveNodeAgentAiSettings";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
@@ -217,7 +222,146 @@ class TrackingRemotePathMappedRuntime extends RemotePathMappedRuntime {
   }
 }
 
+// Project-only listing does not use workspace initialization or AI services.
+function projectListContext(config: Config): AgentDefinitionsContext {
+  return {
+    config,
+    aiService: {
+      getWorkspaceMetadata: () => {
+        throw new Error("Unexpected workspace lookup");
+      },
+      runtimeFactory,
+    },
+    initStateManager: {
+      waitForInit: () => {
+        throw new Error("Unexpected workspace initialization");
+      },
+    },
+  };
+}
+
 describe("agentDefinitionsService", () => {
+  test("Settings lists each agent's own ai layer apart from its base-merged aiDefaults", async () => {
+    using project = new DisposableTempDir("agent-list-own-ai");
+    using home = new DisposableTempDir("agent-list-own-ai-home");
+    const projectRoot = path.join(project.path, ".xum", "agents");
+    await fs.mkdir(projectRoot, { recursive: true });
+    const write = (id: string, frontmatter: string) =>
+      fs.writeFile(
+        path.join(projectRoot, `${id}.md`),
+        `---\nname: ${id}\n${frontmatter}---\nBody.`
+      );
+    await write("explore", "base: explore\nai:\n  thinkingLevel: high\n");
+    await write("scout", "base: explore\n");
+
+    const agents = await listAgentDefinitions(projectListContext(new Config(home.path)), {
+      projectPath: project.path,
+    });
+    const byId = (id: string) => agents.find((agent) => agent.id === id);
+
+    // A same-ID hop refines the built-in explore (cacheTtl 5m) inside its own layer.
+    expect(byId("explore")?.aiLayers?.targetDefinitionAiDefaults).toEqual({
+      cacheTtl: "5m",
+      thinkingLevel: "high",
+    });
+    // Scout inherits explore's frontmatter, which stays out of its own layer.
+    expect(byId("scout")?.aiDefaults).toEqual({ cacheTtl: "5m", thinkingLevel: "high" });
+    expect(byId("scout")?.aiLayers).toEqual({
+      ancestors: [
+        { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m", thinkingLevel: "high" } },
+        { agentId: "exec" },
+      ],
+    });
+  });
+
+  test("Settings lists the base layers a run resolves, which listed bases cannot show", async () => {
+    using project = new DisposableTempDir("agent-list-ancestor-ai");
+    using home = new DisposableTempDir("agent-list-ancestor-ai-home");
+    const write = async (root: string, id: string, frontmatter: string) => {
+      await fs.mkdir(root, { recursive: true });
+      await fs.writeFile(path.join(root, `${id}.md`), `---\nname: ${id}\n${frontmatter}---\nBody.`);
+    };
+    const projectRoot = path.join(project.path, ".xum", "agents");
+    const globalRoot = path.join(home.path, "agents");
+    await write(globalRoot, "refined", "base: exec\n");
+    await write(projectRoot, "refined", "base: refined\n");
+    await write(globalRoot, "helper", "base: exec\n");
+    await write(projectRoot, "bar", "base: helper\n");
+    await write(projectRoot, "exec", "base: exec\nai:\n  cacheTtl: 1h\n");
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = home.path;
+    try {
+      const agents = await listAgentDefinitions(projectListContext(new Config(home.path)), {
+        projectPath: project.path,
+      });
+      const byId = (id: string) => agents.find((agent) => agent.id === id);
+
+      // The project refinement lists `base: refined`, yet runs reach the global agent's base.
+      expect(byId("refined")?.base).toBe("refined");
+      expect(byId("refined")?.aiLayers?.ancestors).toEqual([{ agentId: "exec" }]);
+      // The listed exec is the project's, but a global agent's base resolves past project agents.
+      expect(byId("exec")?.aiLayers?.targetDefinitionAiDefaults).toEqual({ cacheTtl: "1h" });
+      expect(byId("bar")?.aiLayers?.ancestors).toEqual([
+        { agentId: "helper" },
+        { agentId: "exec" },
+      ]);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+
+  test("Settings keeps an agent ID that comes back further down the chain at its later hop", async () => {
+    using project = new DisposableTempDir("agent-list-repeated-id");
+    using home = new DisposableTempDir("agent-list-repeated-id-home");
+    const write = async (root: string, id: string, frontmatter: string) => {
+      await fs.mkdir(root, { recursive: true });
+      await fs.writeFile(path.join(root, `${id}.md`), `---\nname: ${id}\n${frontmatter}---\nBody.`);
+    };
+    await write(path.join(project.path, ".xum", "agents"), "explore", "base: helper\n");
+    await write(path.join(home.path, "agents"), "helper", "base: explore\nai:\n  cacheTtl: 1h\n");
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = home.path;
+    try {
+      const agents = await listAgentDefinitions(projectListContext(new Config(home.path)), {
+        projectPath: project.path,
+      });
+      const aiLayers = agents.find((agent) => agent.id === "explore")?.aiLayers;
+
+      // The global helper's base skips the project explore and reaches the built-in one (5m),
+      // which ranks below helper instead of joining the project explore's own layer.
+      expect(aiLayers).toEqual({
+        ancestors: [
+          { agentId: "helper", definitionAiDefaults: { cacheTtl: "1h" } },
+          { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" } },
+          { agentId: "exec" },
+        ],
+      });
+      expect(resolveAgentCacheTtl({ targetAgentId: "explore", ...aiLayers })?.value).toBe("1h");
+
+      // A run reads the same chain from the checkout.
+      const runtime = new LocalRuntime(project.path);
+      const agentId = AgentIdSchema.parse("explore");
+      const agentDefinition = await readAgentDefinition(runtime, project.path, agentId, {
+        runtimeFactory,
+      });
+      const chain = await resolveAgentInheritanceChain({
+        runtime,
+        workspacePath: project.path,
+        agentId,
+        agentDefinition,
+        workspaceId: "ws",
+        runtimeFactory,
+      });
+      expect(resolveChainAgentCacheTtl("explore", undefined, chain)).toBe("1h");
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+
   test.each([true, false])(
     "Settings lists project overrides and filters disabled agents (disabled=%s)",
     async (disabled) => {
@@ -234,21 +378,7 @@ describe("agentDefinitionsService", () => {
         "---\nname: Project Exec\nai:\n  model: private:project-exec\n---\nProject execution."
       );
       const config = new Config(home.path);
-      // Project-only listing does not use workspace initialization or AI services.
-      const context: AgentDefinitionsContext = {
-        config,
-        aiService: {
-          getWorkspaceMetadata: () => {
-            throw new Error("Unexpected workspace lookup");
-          },
-          runtimeFactory,
-        },
-        initStateManager: {
-          waitForInit: () => {
-            throw new Error("Unexpected workspace initialization");
-          },
-        },
-      };
+      const context = projectListContext(config);
       const list = (includeDisabled = false) =>
         listAgentDefinitions(context, { projectPath: project.path, includeDisabled });
       const all = await list(true);
@@ -271,6 +401,161 @@ describe("agentDefinitionsService", () => {
       }
     }
   );
+
+  describe("ai.settingsBase (Cursor model: fast)", () => {
+    async function listWithPluginAgent(
+      agentFile: string,
+      agentAiDefaults?: AgentAiDefaults,
+      projectAgents: Record<string, string> = {},
+      globalAgents: Record<string, string> = {}
+    ) {
+      using project = new DisposableTempDir("agent-list-settings-base");
+      using home = new DisposableTempDir("agent-list-settings-base-home");
+      const projectRoot = path.join(project.path, ".xum", "agents");
+      await fs.mkdir(projectRoot, { recursive: true });
+      for (const [id, frontmatter] of Object.entries(projectAgents)) {
+        await fs.writeFile(
+          path.join(projectRoot, `${id}.md`),
+          `---\nname: ${id}\n${frontmatter}---\nBody.`
+        );
+      }
+      await fs.mkdir(path.join(home.path, "agents"), { recursive: true });
+      for (const [id, frontmatter] of Object.entries(globalAgents)) {
+        await fs.writeFile(
+          path.join(home.path, "agents", `${id}.md`),
+          `---\nname: ${id}\n${frontmatter}---\nBody.`
+        );
+      }
+      const agentsDir = path.join(home.path, "plugins", "kit", "agents");
+      await fs.mkdir(agentsDir, { recursive: true });
+      await fs.writeFile(
+        path.join(home.path, "plugins", "kit", "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "kit",
+        })
+      );
+      await fs.writeFile(path.join(agentsDir, "ci-watcher.md"), agentFile);
+      const config = new Config(home.path);
+      if (agentAiDefaults != null) {
+        await config.editConfig((cfg) => ({ ...cfg, agentAiDefaults }));
+      }
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = home.path;
+      try {
+        return await listAgentDefinitions(projectListContext(config), {
+          projectPath: project.path,
+        });
+      } finally {
+        if (previousRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousRoot;
+      }
+    }
+
+    const CURSOR_CI_WATCHER =
+      "---\nname: ci-watcher\ndescription: Watch CI\nmodel: fast\nis_background: true\n---\nWatch CI.\n";
+
+    test("a Cursor fast agent lists Explore's layers, its settings base and its background hint", async () => {
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER);
+      const watcher = agents.find((agent) => agent.id === "ci-watcher");
+      expect(watcher?.pluginName).toBe("kit");
+      expect(watcher?.base).toBe("exec");
+      expect(watcher?.aiSettingsBase).toBe("explore");
+      expect(watcher?.backgroundHint).toBe(true);
+      expect(watcher?.aiLayers?.ancestors.map((layer) => layer.agentId)).toEqual([
+        "explore",
+        "exec",
+      ]);
+    });
+
+    test("keeps the settings base when Explore is disabled, and the renderer still reaches Exec", async () => {
+      const agentAiDefaults: AgentAiDefaults = {
+        explore: { enabled: false },
+        exec: { modelString: "custom:m-exec" },
+      };
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, agentAiDefaults);
+      expect(agents.some((agent) => agent.id === "explore")).toBe(false);
+      expect(agents.find((agent) => agent.id === "ci-watcher")?.aiSettingsBase).toBe("explore");
+      // A run resolves [explore, exec]; the renderer's walk must not stop at the unlisted Explore.
+      expect(
+        resolveConfiguredAiDefaults("ci-watcher", agentAiDefaults, getAgentAiSettingsBases(agents))
+          .modelString
+      ).toBe("custom:m-exec");
+    });
+
+    test("lists a global agent's settings-base layers past a project agent of that ID", async () => {
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, undefined, {
+        explore: "base: exec\nai:\n  model: custom:m-project\n",
+      });
+      const watcher = agents.find((agent) => agent.id === "ci-watcher");
+      expect(watcher?.scope).toBe("global");
+      expect(watcher?.aiSettingsBase).toBe("explore");
+      // The built-in Explore's layer, not the project explore.md's model.
+      expect(watcher?.aiLayers?.ancestors).toEqual([
+        { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" } },
+        { agentId: "exec" },
+      ]);
+    });
+
+    test("leaves out a settings base that names a missing agent", async () => {
+      const agents = await listWithPluginAgent(
+        "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: missing-agent\n---\nWatch CI.\n"
+      );
+      const watcher = agents.find((agent) => agent.id === "ci-watcher");
+      expect(watcher).toBeDefined();
+      expect(watcher?.aiSettingsBase).toBeUndefined();
+      expect(watcher?.backgroundHint).toBeUndefined();
+      expect(watcher?.aiLayers?.ancestors[0]?.agentId).toBe("exec");
+    });
+
+    test("leaves out a nested settings base, so the renderer walk follows base as a run does", async () => {
+      const agentAiDefaults: AgentAiDefaults = {
+        helper: { modelString: "custom:m-helper" },
+        explore: { modelString: "custom:m-explore" },
+        exec: { modelString: "custom:m-exec" },
+      };
+      const warn = spyOn(log, "warn");
+      try {
+        const agents = await listWithPluginAgent(
+          "---\nname: ci-watcher\nbase: exec\nai:\n  settingsBase: helper\n---\nWatch CI.\n",
+          agentAiDefaults,
+          {},
+          // Global, as the plugin agent is: a global agent's settings base skips project agents.
+          { helper: "base: exec\nai:\n  settingsBase: explore\n" }
+        );
+        const watcher = agents.find((agent) => agent.id === "ci-watcher");
+        expect(watcher?.aiSettingsBase).toBeUndefined();
+        expect(watcher?.aiLayers?.ancestors.map((layer) => layer.agentId)).toEqual(["exec"]);
+        expect(agents.find((agent) => agent.id === "helper")?.aiSettingsBase).toBe("explore");
+        expect(
+          resolveConfiguredAiDefaults(
+            "ci-watcher",
+            agentAiDefaults,
+            getAgentAiSettingsBases(agents)
+          ).modelString
+        ).toBe("custom:m-exec");
+        expect(warn).toHaveBeenCalledWith("settingsBase ignored", {
+          agentId: "ci-watcher",
+          settingsBase: "helper",
+          reason: "nested",
+        });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    test("leaves out both settings bases of a loop made only of settingsBase links", async () => {
+      const agents = await listWithPluginAgent(CURSOR_CI_WATCHER, undefined, {
+        a: "base: exec\nai:\n  settingsBase: b\n",
+        b: "base: exec\nai:\n  settingsBase: a\n",
+      });
+      for (const id of ["a", "b"]) {
+        const agent = agents.find((listed) => listed.id === id);
+        expect(agent).toBeDefined();
+        expect(agent?.aiSettingsBase).toBeUndefined();
+      }
+    });
+  });
 
   test("project agents override global agents", async () => {
     using project = new DisposableTempDir("agent-defs-project");

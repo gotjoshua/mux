@@ -22,7 +22,7 @@ import {
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
 } from "@/common/constants/stagedAttachments";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
-import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
+import { ChatStatsSchema, ChatUsageDisplaySchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
   NameGenerationErrorSchema,
@@ -147,12 +147,13 @@ import {
   DraftUpdateInputSchema,
   DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
+  CreationDraftDeleteInputSchema,
   CreationDraftImportLegacyInputSchema,
   CreationDraftListSchema,
   CreationDraftSchema,
   CreationDraftScopeSchema,
-  CreationDraftSummarySchema,
   CreationDraftUpdateInputSchema,
+  CreationDraftUpdateOutputSchema,
 } from "./drafts";
 import {
   AgentMessageDispatchModeSchema,
@@ -1298,6 +1299,8 @@ export const agentPlugins = {
       key: z.string(),
       hash: z.string(),
       state: z.enum(["trusted", "disabled"]).nullable(),
+      /** `getHooks().fileReview.digest`: required to trust while that review is shown. */
+      fileReviewDigest: z.string().optional(),
     }),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -1459,6 +1462,10 @@ const DebugLlmRequestSnapshotSchema = z
 const ArchiveLossyUntrackedFilesConfirmationSchema = z.object({
   kind: z.literal("confirm-lossy-untracked-files"),
   paths: z.array(z.string()),
+  /** Sub-agents the archive cascades over whose snapshot archives would lose these paths. */
+  subagents: z
+    .array(z.object({ workspaceId: z.string(), title: z.string(), paths: z.array(z.string()) }))
+    .optional(),
 });
 
 const ArchivePreflightResultSchema = z.discriminatedUnion("kind", [
@@ -2069,6 +2076,8 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       acknowledgedUntrackedPaths: z.array(z.string()).nullish(),
+      /** Per sub-agent workspace ID: the untracked paths the user confirmed losing. */
+      acknowledgedSubagentUntrackedPaths: z.record(z.string(), z.array(z.string())).optional(),
     }),
     output: ResultSchema(ArchiveWorkspaceResultSchema, z.string()),
   },
@@ -2605,6 +2614,11 @@ export const workspace = {
             workspaceId: z.string(),
             activity: WorkspaceActivitySnapshotSchema.nullable(),
           }),
+          // A write changed this workspace's session usage (its ledger or a running stream's).
+          z.object({
+            type: z.literal("usage-changed"),
+            workspaceId: z.string(),
+          }),
           HeartbeatEventSchema,
         ])
       ),
@@ -2798,6 +2812,22 @@ export const workspace = {
   getSessionUsage: {
     input: z.object({ workspaceId: z.string() }),
     output: SessionUsageFileSchema.optional(),
+  },
+  /**
+   * Usage of the workspace's sub-agents that still exist (not yet rolled into its ledger).
+   * The Costs tab adds it to the session cost so delegated spend is visible before removal.
+   */
+  getSubagentUsage: {
+    input: z.object({ workspaceId: z.string() }),
+    output: z.object({
+      children: z.record(
+        z.string(),
+        z.object({
+          byModel: z.record(z.string(), ChatUsageDisplaySchema),
+          workspaceCount: z.number().int().nonnegative(),
+        })
+      ),
+    }),
   },
   /** Batch fetch session usage for multiple workspaces (for archived workspaces cost display) */
   getSessionUsageBatch: {
@@ -3876,10 +3906,10 @@ export const drafts = {
   },
   updateCreation: {
     input: CreationDraftUpdateInputSchema,
-    output: CreationDraftSummarySchema,
+    output: CreationDraftUpdateOutputSchema,
   },
   deleteCreation: {
-    input: z.object({ scope: CreationDraftScopeSchema }),
+    input: CreationDraftDeleteInputSchema,
     output: z.void(),
   },
   importLegacyCreation: {

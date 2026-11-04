@@ -57,6 +57,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
 - `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
 - `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.
+- To wait on PR checks, a stack or the merge queue, run `./scripts/watch_pr_state.sh <pr>... [--queue]` instead of a hand-written polling loop. It prints each state change, ends on every final state (merged, removed from the queue, closed, failed, ready) and exits 2 on a read it cannot classify.
 
 ## Dependencies & Supply Chain
 
@@ -75,6 +76,8 @@ Core workflow:
 2. `agent-browser snapshot -i` - Get interactive elements with refs (@e1, @e2)
 3. `agent-browser click @e1` / `fill @e2 "text"` - Interact using refs
 4. Re-snapshot after page changes
+
+Never `open` a URL that carries a token or another credential: it is readable in the command line, and every `agent-browser` session has a loopback WebSocket stream and Chrome has a DevTools port, with no credential on either. To open an authenticated dev-server sandbox, use the recipe in the `dev-server-sandbox` skill.
 
 ## PR Workflow
 

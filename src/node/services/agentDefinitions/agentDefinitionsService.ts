@@ -16,6 +16,11 @@ import { resolveAgentVisibility } from "./agentVisibility";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  applySettingsBaseChain,
+  collectDefinitionLayers,
+  settingsBaseHop,
+} from "@/common/utils/ai/agentAncestorLayers";
+import {
   execBuffered,
   readFileString,
   throwIfTransportFailure,
@@ -619,6 +624,7 @@ async function readAgentDescriptorFromFile(
       uiSelectable: selectable,
       uiColor: parsed.frontmatter.ui?.color,
       subagentRunnable: parsed.frontmatter.subagent?.runnable ?? false,
+      ...backgroundHintField(parsed.frontmatter),
       base: parsed.frontmatter.base,
       aiDefaults: parsed.frontmatter.ai,
       tools: parsed.frontmatter.tools,
@@ -639,6 +645,12 @@ async function readAgentDescriptorFromFile(
   }
 }
 
+export function backgroundHintField(
+  frontmatter: Pick<AgentDefinitionPackage["frontmatter"], "subagent">
+): { backgroundHint?: true } {
+  return frontmatter.subagent?.background_hint === true ? { backgroundHint: true } : {};
+}
+
 function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescriptor {
   const { selectable } = resolveAgentVisibility(pkg.frontmatter.ui);
 
@@ -650,6 +662,7 @@ function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescr
     uiSelectable: selectable,
     uiColor: pkg.frontmatter.ui?.color,
     subagentRunnable: pkg.frontmatter.subagent?.runnable ?? false,
+    ...backgroundHintField(pkg.frontmatter),
     base: pkg.frontmatter.base,
     aiDefaults: pkg.frontmatter.ai,
     tools: pkg.frontmatter.tools,
@@ -864,6 +877,30 @@ export interface ReadAgentDefinitionOptions {
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
 
+/** The skip scope of a base read in an inheritance walk: whichever of the two skips more. */
+function mergeSkipScopesAbove(
+  a: AgentDefinitionScope | undefined,
+  b: AgentDefinitionScope | undefined
+): AgentDefinitionScope | undefined {
+  if (!a) {
+    return b;
+  }
+  if (!b) {
+    return a;
+  }
+
+  const aIndex = SCOPE_PRIORITY.indexOf(a);
+  const bIndex = SCOPE_PRIORITY.indexOf(b);
+
+  // Defensive fallback. (In practice, both should always be in SCOPE_PRIORITY.)
+  if (aIndex === -1 || bIndex === -1) {
+    return a;
+  }
+
+  // Prefer the scope that skips *more* (e.g. global skips project+global).
+  return aIndex > bIndex ? a : b;
+}
+
 /** The caller's roots, else the default roots for its trust (discovery and reads share it). */
 function resolveAgentDefinitionsRoots(
   runtime: Runtime,
@@ -1073,28 +1110,6 @@ export async function resolveAgentBody(
   const visited = new Set<string>();
   const baseReadOptions = pickInheritedReadOptions(options);
 
-  function mergeSkipScopesAbove(
-    a: AgentDefinitionScope | undefined,
-    b: AgentDefinitionScope | undefined
-  ): AgentDefinitionScope | undefined {
-    if (!a) {
-      return b;
-    }
-    if (!b) {
-      return a;
-    }
-
-    const aIndex = SCOPE_PRIORITY.indexOf(a);
-    const bIndex = SCOPE_PRIORITY.indexOf(b);
-
-    // Defensive fallback. (In practice, both should always be in SCOPE_PRIORITY.)
-    if (aIndex === -1 || bIndex === -1) {
-      return a;
-    }
-
-    return aIndex > bIndex ? a : b;
-  }
-
   async function resolve(
     id: AgentId,
     depth: number,
@@ -1197,6 +1212,22 @@ function deepMergeAgentFrontmatter(
   return overlay;
 }
 
+interface ResolvedAgentDefinitionWithAiChain {
+  definition: AgentDefinitionPackage;
+  /**
+   * Each hop's own (unmerged) `ai`, target first. The walk skips the scopes that
+   * resolveAgentInheritanceChain skips, so collectDefinitionLayers over it gives the layers a
+   * run of the agent resolves.
+   */
+  aiChain: AiChainHop[];
+}
+
+interface AiChainHop {
+  id: AgentId;
+  ai?: AgentDefinitionPackage["frontmatter"]["ai"];
+  scope: AgentDefinitionScope;
+}
+
 /**
  * Resolve prompt and frontmatter in one base-chain walk so callers authorize
  * and execute the same definition snapshot. Frontmatter always inherits when
@@ -1208,6 +1239,16 @@ export async function resolveAgentDefinition(
   agentId: AgentId,
   options: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
+  return (await resolveAgentDefinitionWithAiChain(runtime, workspacePath, agentId, options))
+    .definition;
+}
+
+async function resolveAgentDefinitionWithAiChain(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options: ReadAgentDefinitionOptions
+): Promise<ResolvedAgentDefinitionWithAiChain> {
   if (!workspacePath) {
     throw new Error("resolveAgentFrontmatter: workspacePath is required");
   }
@@ -1215,34 +1256,11 @@ export async function resolveAgentDefinition(
   const visited = new Set<string>();
   const baseReadOptions = pickInheritedReadOptions(options);
 
-  function mergeSkipScopesAbove(
-    a: AgentDefinitionScope | undefined,
-    b: AgentDefinitionScope | undefined
-  ): AgentDefinitionScope | undefined {
-    if (!a) {
-      return b;
-    }
-    if (!b) {
-      return a;
-    }
-
-    const aIndex = SCOPE_PRIORITY.indexOf(a);
-    const bIndex = SCOPE_PRIORITY.indexOf(b);
-
-    // Defensive fallback. (In practice, both should always be in SCOPE_PRIORITY.)
-    if (aIndex === -1 || bIndex === -1) {
-      return a;
-    }
-
-    // Prefer the scope that skips *more* (e.g. global skips project+global).
-    return aIndex > bIndex ? a : b;
-  }
-
   async function resolve(
     id: AgentId,
     depth: number,
     skipScopesAbove?: AgentDefinitionScope
-  ): Promise<AgentDefinitionPackage> {
+  ): Promise<ResolvedAgentDefinitionWithAiChain> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
         `Agent inheritance depth exceeded for '${id}' (max: ${MAX_INHERITANCE_DEPTH})`
@@ -1260,16 +1278,18 @@ export async function resolveAgentDefinition(
     }
     visited.add(visitKey);
 
+    const hop = { id: pkg.id, ai: pkg.frontmatter.ai, scope: pkg.scope };
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
-      return pkg;
+      return { definition: pkg, aiChain: [hop] };
     }
 
-    const base = await resolve(
+    const resolvedBase = await resolve(
       baseId,
       depth + 1,
       mergeSkipScopesAbove(skipScopesAbove, computeBaseSkipScope(baseId, id, pkg.scope))
     );
+    const base = resolvedBase.definition;
 
     const mergedRaw = deepMergeAgentFrontmatter(base.frontmatter, pkg.frontmatter, []);
     const merged = AgentDefinitionFrontmatterSchema.safeParse(mergedRaw);
@@ -1281,10 +1301,15 @@ export async function resolveAgentDefinition(
 
     const separator = base.body.trim() && pkg.body.trim() ? "\n\n" : "";
     return {
-      ...pkg,
-      frontmatter: merged.data,
-      body:
-        pkg.frontmatter.prompt?.append === false ? pkg.body : `${base.body}${separator}${pkg.body}`,
+      definition: {
+        ...pkg,
+        frontmatter: merged.data,
+        body:
+          pkg.frontmatter.prompt?.append === false
+            ? pkg.body
+            : `${base.body}${separator}${pkg.body}`,
+      },
+      aiChain: [hop, ...resolvedBase.aiChain],
     };
   }
 
@@ -1380,6 +1405,33 @@ export async function resolveAgentDiscoveryContext(
   };
 }
 
+/**
+ * A listed agent's `aiLayers`, and its `aiSettingsBase` only when applied (D26). The settings
+ * base is read as a run reads it (resolveAgentAiSettingsChain): anchored to the declaring hop's
+ * scope, and whether or not it is disabled.
+ */
+async function listedAgentAiSettings(
+  agentId: AgentId,
+  aiChain: AiChainHop[],
+  readAiChain: (id: AgentId, skipScopesAbove?: AgentDefinitionScope) => Promise<AiChainHop[] | null>
+): Promise<Pick<AgentDefinitionDescriptor, "aiLayers" | "aiSettingsBase">> {
+  const hop = settingsBaseHop(aiChain);
+  const settingsBase = hop?.ai?.settingsBase;
+  if (hop == null || settingsBase == null) {
+    return { aiLayers: collectDefinitionLayers(agentId, aiChain) };
+  }
+  const skipScopesAbove = computeBaseSkipScope(settingsBase, hop.id, hop.scope);
+  const result = applySettingsBaseChain(
+    agentId,
+    aiChain,
+    await readAiChain(settingsBase, skipScopesAbove)
+  );
+  const aiLayers = collectDefinitionLayers(agentId, result.chain);
+  if (result.ignored == null) return { aiLayers, aiSettingsBase: settingsBase };
+  log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });
+  return { aiLayers };
+}
+
 export async function listAgentDefinitions(
   context: AgentDefinitionsContext,
   input: {
@@ -1400,10 +1452,19 @@ export async function listAgentDefinitions(
     runtimeFactory,
   });
   const cfg = context.config.loadConfigOrDefault();
+  const readAiChain = (agentId: AgentId, skipScopesAbove?: AgentDefinitionScope) =>
+    resolveAgentDefinitionWithAiChain(runtime, discoveryPath, agentId, {
+      skipScopesAbove,
+      projectPluginsTrusted,
+      runtimeFactory,
+    }).then(
+      (resolvedDefinition) => resolvedDefinition.aiChain,
+      () => null
+    );
   const resolved = await Promise.all(
     descriptors.map(async (descriptor) => {
       try {
-        const resolvedFrontmatter = await resolveAgentFrontmatter(
+        const resolvedDefinition = await resolveAgentDefinitionWithAiChain(
           runtime,
           discoveryPath,
           descriptor.id,
@@ -1413,12 +1474,21 @@ export async function listAgentDefinitions(
             runtimeFactory,
           }
         );
+        const resolvedFrontmatter = resolvedDefinition.definition.frontmatter;
         if (
           isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
           input.includeDisabled !== true
         )
           return null;
-        return { descriptor, resolvedFrontmatter };
+        return {
+          descriptor,
+          resolvedFrontmatter,
+          aiSettings: await listedAgentAiSettings(
+            descriptor.id,
+            resolvedDefinition.aiChain,
+            readAiChain
+          ),
+        };
       } catch {
         return { descriptor };
       }
@@ -1436,8 +1506,10 @@ export async function listAgentDefinitions(
         uiSelectable: resolveAgentVisibility(frontmatter.ui).selectable,
         uiColor: frontmatter.ui?.color,
         subagentRunnable: frontmatter.subagent?.runnable ?? false,
+        ...backgroundHintField(frontmatter),
         base: frontmatter.base,
         aiDefaults: frontmatter.ai,
+        ...entry.aiSettings,
         tools: frontmatter.tools,
       },
     ];
